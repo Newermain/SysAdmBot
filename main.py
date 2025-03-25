@@ -1,6 +1,6 @@
 import logging
 import re
-import sqlite3
+import aiosqlite
 import asyncio
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
@@ -10,10 +10,8 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    InputFile,
     ReplyKeyboardRemove
 )
-from aiogram.utils.markdown import text
 from aiogram.enums import ParseMode
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,11 +23,11 @@ logger = logging.getLogger(__name__)
 
 # --- Конфигурация ---
 BOT_TOKEN = "7183399679:AAHKKtnKMFzuQX_R67_TzVkhwhrAobFiGDo"
-ADMIN_CHAT_ID = -1002595180902  
+ADMIN_CHAT_ID = -1002595180902
 DATABASE_NAME = "requests.db"
 
 # --- Инициализация бота ---
-storage = MemoryStorage()  # Хранилище состояний
+storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
@@ -37,7 +35,6 @@ dp = Dispatcher(storage=storage)
 departments = ["IT", "Бухгалтерия", "HR", "Маркетинг", "Продажи", "Другое"]
 
 def get_departments_keyboard():
-    # В aiogram 3.x кнопки передаются через keyboard
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=dept)] for dept in departments
@@ -49,8 +46,8 @@ def get_departments_keyboard():
 def get_admin_keyboard(request_id):
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="✅ В работе", callback_data=f"status_working_{request_id}")],
-            [InlineKeyboardButton(text="✔️ Решено", callback_data=f"status_done_{request_id}")],
+            [InlineKeyboardButton(text="🔄 В работе", callback_data=f"status_working_{request_id}")],
+            [InlineKeyboardButton(text="✔️ Решено", callback_data=f"status_done_{request_id}")]
         ]
     )
 
@@ -59,12 +56,12 @@ class RequestForm(StatesGroup):
     department = State()
     full_name = State()
     problem = State()
-    photo = State()
 
-# --- База данных ---
-def init_db():
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        conn.execute("""
+# --- Инициализация базы данных ---
+async def init_db():
+    async with aiosqlite.connect(DATABASE_NAME) as db:
+        await db.execute("DROP TABLE IF EXISTS requests")  # Удаляем старую таблицу
+        await db.execute("""
         CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -72,15 +69,15 @@ def init_db():
             full_name TEXT,
             department TEXT,
             problem TEXT,
-            photo_id TEXT,
             status TEXT DEFAULT 'new',
-            created_at TEXT
+            created_at TEXT,
+            admin_message_id INTEGER
         )
         """)
+        await db.commit()
+        logger.info("База данных инициализирована")
 
-init_db()
-
-# --- Обработчики ---
+# --- Обработчики команд ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -100,6 +97,7 @@ async def start_request(callback: types.CallbackQuery, state: FSMContext):
     )
     await state.set_state(RequestForm.department)
 
+# --- Обработка заявки ---
 @dp.message(RequestForm.department)
 async def process_department(message: types.Message, state: FSMContext):
     await state.update_data(department=message.text)
@@ -118,94 +116,116 @@ async def process_full_name(message: types.Message, state: FSMContext):
 @dp.message(RequestForm.problem)
 async def process_problem(message: types.Message, state: FSMContext):
     await state.update_data(problem=message.text)
-    await message.answer("📸 Пришлите скриншот (если нужно). Или нажмите /skip.")
-    await state.set_state(RequestForm.photo)
-
-@dp.message(RequestForm.photo, F.photo)
-async def process_photo(message: types.Message, state: FSMContext):
-    await state.update_data(photo_id=message.photo[-1].file_id)
-    await finish_request(message, state)
-
-@dp.message(RequestForm.photo, Command("skip"))
-async def skip_photo(message: types.Message, state: FSMContext):
-    await state.update_data(photo_id=None)
     await finish_request(message, state)
 
 async def finish_request(message: types.Message, state: FSMContext):
     data = await state.get_data()
     
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO requests VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                message.from_user.id,
-                message.from_user.username,
-                data["full_name"],
-                data["department"],
-                data["problem"],
-                data.get("photo_id"),
-                "new",
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        async with aiosqlite.connect(DATABASE_NAME) as db:
+            # Вставляем основную информацию о заявке
+            cursor = await db.execute(
+                "INSERT INTO requests (user_id, username, full_name, department, problem, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    message.from_user.id,
+                    message.from_user.username,
+                    data["full_name"],
+                    data["department"],
+                    data["problem"],
+                    "new",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
             )
+            request_id = cursor.lastrowid
+            await db.commit()
+
+        # Формируем текст заявки
+        request_text = (
+            f"🚨 Заявка #{request_id}\n"
+            f"👤 ФИО: {data['full_name']}\n"
+            f"🏢 Отдел: {data['department']}\n"
+            f"📝 Проблема: {data['problem']}\n"
+            f"🕒 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
+            f"🆕 Статус: Новая"
         )
-        request_id = cursor.lastrowid
-    
-    admin_text = (
-        f"🚨 Новая заявка #{request_id}\n"
-        f"👤 ФИО: {data['full_name']}\n"
-        f"🏢 Отдел: {data['department']}\n"
-        f"📝 Проблема: {data['problem']}\n"
-        f"🕒 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
-    )
-    
-    if data.get("photo_id"):
-        await bot.send_photo(
+        
+        # Отправляем заявку админу
+        admin_msg = await bot.send_message(
             chat_id=ADMIN_CHAT_ID,
-            photo=data["photo_id"],
-            caption=admin_text,
+            text=request_text,
             reply_markup=get_admin_keyboard(request_id)
         )
-    else:
-        await bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=admin_text,
-            reply_markup=get_admin_keyboard(request_id)
+        
+        # Обновляем запись с ID сообщения админа
+        async with aiosqlite.connect(DATABASE_NAME) as db:
+            await db.execute(
+                "UPDATE requests SET admin_message_id = ? WHERE id = ?",
+                (admin_msg.message_id, request_id)
+            )
+            await db.commit()
+
+        await message.answer(
+            "✅ Спасибо! Заявка создана.\nМы скоро её обработаем!",
+            reply_markup=ReplyKeyboardRemove()
         )
-    
-    await message.answer(
-        "✅ Спасибо! Заявка создана.\nМы скоро её обработаем!",
-        reply_markup=ReplyKeyboardRemove()
-    )
-    await state.clear()
+        
+    except Exception as e:
+        logger.error(f"Ошибка при создании заявки: {e}")
+        await message.answer(
+            "⚠️ Произошла ошибка при создании заявки. Пожалуйста, попробуйте позже.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    finally:
+        await state.clear()
 
 @dp.callback_query(F.data.startswith("status_"))
 async def update_status(callback: types.CallbackQuery):
-    _, action, request_id = callback.data.split("_")
-    
-    with sqlite3.connect(DATABASE_NAME) as conn:
-        status = "working" if action == "working" else "done"
-        conn.execute(
-            "UPDATE requests SET status = ? WHERE id = ?",
-            (status, request_id)
-        )
-    
-    status_text = "⏳ В работе" if action == "working" else "✅ Решено"
-    
-    if callback.message.caption:
-        await callback.message.edit_caption(
-            caption=f"{callback.message.caption}\n\nСтатус: {status_text}",
-            reply_markup=get_admin_keyboard(request_id)
-        )
-    else:
-        await callback.message.edit_text(
-            text=f"{callback.message.text}\n\nСтатус: {status_text}",
-            reply_markup=get_admin_keyboard(request_id)
-        )
-    
-    await callback.answer(f"Статус заявки #{request_id} изменен!")
+    try:
+        _, action, request_id = callback.data.split("_")
+        new_status = "working" if action == "working" else "done"
+        status_text = "🔄 В работе" if action == "working" else "✅ Решено"
 
+        async with aiosqlite.connect(DATABASE_NAME) as db:
+            # Обновляем статус в базе
+            await db.execute(
+                "UPDATE requests SET status = ? WHERE id = ?",
+                (new_status, request_id)
+            )
+            
+            # Получаем данные заявки
+            cursor = await db.execute(
+                "SELECT full_name, department, problem, admin_message_id FROM requests WHERE id = ?",
+                (request_id,)
+            )
+            full_name, department, problem, admin_message_id = await cursor.fetchone()
+            await db.commit()
+
+        # Формируем обновленный текст
+        updated_text = (
+            f"🚨 Заявка #{request_id}\n"
+            f"👤 ФИО: {full_name}\n"
+            f"🏢 Отдел: {department}\n"
+            f"📝 Проблема: {problem}\n"
+            f"🕒 Статус: {status_text}"
+        )
+
+        # Обновляем сообщение
+        await bot.edit_message_text(
+            chat_id=ADMIN_CHAT_ID,
+            message_id=admin_message_id,
+            text=updated_text,
+            reply_markup=get_admin_keyboard(request_id)
+        )
+
+        await callback.answer(f"Статус заявки #{request_id} изменен на: {status_text}")
+    except Exception as e:
+        logger.error(f"Ошибка при обновлении статуса: {e}")
+        await callback.answer("⚠️ Произошла ошибка при обновлении статуса", show_alert=True)
+
+# --- Запуск бота ---
 async def main():
+    await init_db()  # Инициализация БД перед запуском
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
