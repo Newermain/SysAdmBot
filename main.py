@@ -25,8 +25,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-BOT_TOKEN = "8125237649:AAHiHUVctjsSamLG7V_AH5TBbkofDLe8p3w"
-ADMIN_CHAT_ID = -1002595180902
+BOT_TOKEN = "token_bot"
+ADMIN_CHAT_ID = ID_chat
 DATABASE_NAME = "requests.db"
 
 # Инициализация бота
