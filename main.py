@@ -25,8 +25,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-BOT_TOKEN = "token_bot"
-ADMIN_CHAT_ID = ID chat
+BOT_TOKEN = "8125237649:AAHiHUVctjsSamLG7V_AH5TBbkofDLe8p3w"
+ADMIN_CHAT_ID = -1002595180902
 DATABASE_NAME = "requests.db"
 
 # Инициализация бота
@@ -35,7 +35,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
 # Клавиатуры
-departments = ["IT", "Бухгалтерия", "HR", "Маркетинг", "Продажи", "Другое"]
+departments = ["Административно-управленческий", "Бухгалтерия", "Продажи", "Маркетинг", "Логистика/Снабжение", "Дизайн", "Веб-разработка", "Тех Контроль", "Инженерно-техническая служба", "Контроль качества", "Планово-экономический"]
 
 def get_departments_keyboard():
     return ReplyKeyboardMarkup(
