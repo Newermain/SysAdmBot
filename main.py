@@ -26,6 +26,8 @@ from reportlab.platypus import Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph
 from io import BytesIO
+from reportlab.lib.enums import TA_JUSTIFY
+from reportlab.platypus import SimpleDocTemplate, Spacer
 
 # Настройка логирования
 logging.basicConfig(
@@ -35,10 +37,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Конфигурация
-BOT_TOKEN = "token_bot"
-ADMIN_CHAT_ID = chat_id
-ADMIN_ID = id_admin
-DATABASE_NAME = "name.db"
+BOT_TOKEN = "8125237649:AAHiHUVctjsSamLG7V_AH5TBbkofDLe8p3w"
+ADMIN_CHAT_ID = -1002595180902
+ADMIN_ID = 814124459
+DATABASE_NAME = "requests.db"
 
 # Инициализация бота
 storage = MemoryStorage()
@@ -46,7 +48,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
 # Клавиатуры
-departments = ["Административно-управленческий", "Бухгалтерия", "Продажи", "Маркетинг", "Логистика/Снабжение", "Дизайн", "Веб-разработка", "Тех Контроль", "Инженерно-техническая служба", "Контроль качества", "Планово-экономический"]
+departments = ["Административно-управленческий", "Бухгалтерия", "Продажи", "Маркетинг", "Логистика/Снабжение", "Дизайн", "Веб-разработка", "Тех Контроль", "Инженерно-техническая служба", "Контроль качества", "Планово-экономический", "Питер", "Парифарм", "Воскресенка", "Склад"]
 
 request_types = ["🚨 Проблема (что-то сломалось)", "🛒 Закупка оборудования"]
 
@@ -97,9 +99,8 @@ class RequestForm(StatesGroup):
 # Инициализация базы данных
 async def init_db():
     async with aiosqlite.connect(DATABASE_NAME) as db:
-        await db.execute("DROP TABLE IF EXISTS requests")
         await db.execute("""
-        CREATE TABLE requests (
+        CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             username TEXT,
@@ -114,8 +115,8 @@ async def init_db():
         )
         """)
         await db.commit()
-        logger.info("База данных инициализирована")
-
+        logger.info("Проверка базы данных выполнена")
+        
 # Команда для просмотра заявок
 @dp.message(Command("my_requests"))
 async def show_my_requests(message: types.Message):
@@ -181,154 +182,166 @@ async def cmd_create_request(message: types.Message, state: FSMContext):
     )
     await state.set_state(RequestForm.request_type)
 
-# Обработчик команды генерации отчетов
 @dp.message(Command("generate_reports"))
 async def generate_reports(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         await message.answer("Эта команда доступна только администратору")
         return
 
+    # Разбираем аргументы команды
+    args = message.text.split()[1:]  # Пропускаем саму команду
+    date_format = "%Y-%m-%d"  # Формат даты для парсинга
+
+    # Устанавливаем даты по умолчанию (все записи)
+    start_date = "1970-01-01"
+    end_date = "2099-12-31"
+
+    # Парсим переданные даты, если они есть
+    if len(args) >= 2:
+        try:
+            start_date = args[0]
+            end_date = args[1]
+            # Проверяем, что даты валидны
+            datetime.strptime(start_date, date_format)
+            datetime.strptime(end_date, date_format)
+            
+            # Проверяем, что начальная дата не позже конечной
+            if start_date > end_date:
+                await message.answer("⚠️ Начальная дата не может быть позже конечной")
+                return
+                
+        except ValueError:
+            await message.answer("⚠️ Неверный формат дат. Используйте: /generate_reports [YYYY-MM-DD] [YYYY-MM-DD]")
+            return
+
     try:
-        # 1. Загружаем данные из базы
+        # 1. Загружаем данные из базы с фильтрацией по дате
         async with aiosqlite.connect(DATABASE_NAME) as db:
-            # Заявки на проблемы
             cursor = await db.execute(
                 """SELECT id, created_at, full_name, problem, status 
                 FROM requests 
                 WHERE request_type = ? 
+                AND date(created_at) BETWEEN date(?) AND date(?)
                 ORDER BY created_at""",
-                ("🚨 Проблема (что-то сломалось)",)
+                ("🚨 Проблема (что-то сломалось)", start_date, end_date)
             )
             problems = await cursor.fetchall()
 
-            # Заявки на закупки
             cursor = await db.execute(
                 """SELECT id, created_at, full_name, problem, status 
                 FROM requests 
                 WHERE request_type = ? 
+                AND date(created_at) BETWEEN date(?) AND date(?)
                 ORDER BY created_at""",
-                ("🛒 Закупка оборудования",)
+                ("🛒 Закупка оборудования", start_date, end_date)
             )
             purchases = await cursor.fetchall()
 
-        # 2. Регистрируем шрифты (должны быть в одной папке со скриптом)
+        # 2. Регистрируем шрифты
         try:
             pdfmetrics.registerFont(TTFont('DejaVu', 'DejaVuSans.ttf'))
             pdfmetrics.registerFont(TTFont('DejaVu-Bold', 'DejaVuSans-Bold.ttf'))
             main_font = 'DejaVu'
         except:
-            # Fallback на стандартные шрифты (может не поддерживать кириллицу)
             main_font = 'Helvetica'
-            await message.answer("⚠️ Используются стандартные шрифты (возможны проблемы с кириллицей)")
+            await message.answer("⚠️ Используются стандартные шрифты")
 
-        # 3. Создаем отчет по проблемам
-        problems_buffer = BytesIO()
-        p = canvas.Canvas(problems_buffer, pagesize=A4)
-        width, height = A4
+        # 3. Создаем стили для переноса текста
+        styles = getSampleStyleSheet()
+        style_normal = styles["BodyText"]
+        style_normal.fontName = main_font
+        style_normal.fontSize = 8
+        style_normal.leading = 10
+        style_normal.alignment = TA_JUSTIFY
 
-        # Заголовок отчета
-        p.setFont(f'{main_font}-Bold', 16)
-        p.drawString(50, height - 50, "Отчет по проблемам")
-        p.setFont(main_font, 12)
-        p.drawString(50, height - 80, f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+        # 4. Функция для создания PDF
+        def create_pdf(data, title):
+            buffer = BytesIO()
+            doc = SimpleDocTemplate(buffer, pagesize=A4)
+            width, height = A4
+            
+            # Стиль для заголовка
+            style_title = styles["Title"]
+            style_title.fontName = f"{main_font}-Bold" if f"{main_font}-Bold" in pdfmetrics.getRegisteredFontNames() else main_font
+            style_title.fontSize = 16
+            style_title.leading = 18
+            style_title.spaceAfter = 12
+    
+            # Стиль для подзаголовка
+            style_subtitle = styles["BodyText"]
+            style_subtitle.fontName = main_font
+            style_subtitle.fontSize = 12
+            style_subtitle.leading = 14
+    
+            elements = []
+    
+            # Заголовок с явным указанием шрифта
+            elements.append(Paragraph(f"<font name='{main_font}'><b>{title}</b></font>", style_title))
+    
+            # Подзаголовок с датой
+            elements.append(Paragraph(
+                f"<font name='{main_font}'>Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}</font>",
+                style_subtitle
+            ))
+    
+            elements.append(Spacer(1, 12))
+            
+            # Подготовка данных таблицы
+            table_data = [
+                [
+                    Paragraph("<b>№</b>", style_normal),
+                    Paragraph("<b>Дата</b>", style_normal),
+                    Paragraph("<b>Заявитель</b>", style_normal),
+                    Paragraph("<b>Описание</b>", style_normal),
+                    Paragraph("<b>Статус</b>", style_normal)
+                ]
+            ]
+            
+            for row in data:
+                date = datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
+                table_data.append([
+                    Paragraph(str(row[0]), style_normal),
+                    Paragraph(date, style_normal),
+                    Paragraph(row[2], style_normal),
+                    Paragraph(row[3], style_normal),
+                    Paragraph(row[4], style_normal)
+                ])
+            
+            # Создаем таблицу с адаптивными размерами
+            table = Table(table_data, colWidths=[30, 60, 120, None, 60])
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('WORDWRAP', (0, 0), (-1, -1), True),
+            ]))
+            
+            elements.append(table)
+            doc.build(elements)
+            buffer.seek(0)
+            return buffer
 
-        # Подготовка данных для таблицы
-        data = [["№", "Дата", "Заявитель", "Проблема", "Статус"]]
-        for row in problems:
-            date = datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
-            data.append([
-                str(row[0]),
-                date,
-                row[2],
-                row[3][:50] + ("..." if len(row[3]) > 50 else ""),
-                row[4]
-            ])
+        # 5. Создаем и отправляем отчеты
+        await message.answer(f"Формирую отчеты за период: {start_date} - {end_date}")
 
-        # Создаем таблицу
-        table = Table(data, colWidths=[30, 60, 120, 200, 60])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), f'{main_font}-Bold'),
-            ('FONTNAME', (0, 1), (-1, -1), main_font),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ]))
-
-        # Размещаем таблицу на странице
-        table.wrapOn(p, width - 100, height)
-        table.drawOn(p, 50, height - 120 - len(problems)*20)
-
-        p.save()
-        problems_buffer.seek(0)
-
-        # 4. Создаем отчет по закупкам (аналогично)
-        purchases_buffer = BytesIO()
-        p = canvas.Canvas(purchases_buffer, pagesize=A4)
-
-        # Заголовок отчета
-        p.setFont(f'{main_font}-Bold', 16)
-        p.drawString(50, height - 50, "Отчет по закупкам")
-        p.setFont(main_font, 12)
-        p.drawString(50, height - 80, f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-
-        # Подготовка данных для таблицы
-        data = [["№", "Дата", "Заявитель", "Оборудование", "Статус"]]
-        for row in purchases:
-            date = datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
-            data.append([
-                str(row[0]),
-                date,
-                row[2],
-                row[3][:50] + ("..." if len(row[3]) > 50 else ""),
-                row[4]
-            ])
-
-        # Создаем таблицу
-        table = Table(data, colWidths=[30, 60, 120, 200, 60])
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), f'{main_font}-Bold'),
-            ('FONTNAME', (0, 1), (-1, -1), main_font),
-            ('FONTSIZE', (0, 0), (-1, -1), 8),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ]))
-
-        # Размещаем таблицу на странице
-        table.wrapOn(p, width - 100, height)
-        table.drawOn(p, 50, height - 120 - len(purchases)*20)
-
-        p.save()
-        purchases_buffer.seek(0)
-
-        # 5. Отправляем отчеты
-        await message.answer("Отчеты сформированы:")
-
+        problems_pdf = create_pdf(problems, f"Отчет по проблемам ({start_date} - {end_date})")
         await bot.send_document(
             chat_id=message.from_user.id,
             document=types.BufferedInputFile(
-                problems_buffer.getvalue(),
-                filename="problems_report.pdf"
+                problems_pdf.getvalue(),
+                filename=f"problems_report_{start_date}_{end_date}.pdf"
             ),
-            caption="Отчет по проблемам"
+            caption=f"Отчет по проблемам за {start_date} - {end_date}"
         )
 
+        purchases_pdf = create_pdf(purchases, f"Отчет по закупкам ({start_date} - {end_date})")
         await bot.send_document(
             chat_id=message.from_user.id,
             document=types.BufferedInputFile(
-                purchases_buffer.getvalue(),
-                filename="purchases_report.pdf"
+                purchases_pdf.getvalue(),
+                filename=f"purchases_report_{start_date}_{end_date}.pdf"
             ),
-            caption="Отчет по закупкам"
+            caption=f"Отчет по закупкам за {start_date} - {end_date}"
         )
 
     except Exception as e:
@@ -357,58 +370,30 @@ async def process_department(message: types.Message, state: FSMContext):
         
     await state.update_data(department=message.text)
     await message.answer(
-        "📝 Введите ваше ФИО и логин Telegram в формате:\n"
-        "<b>Фамилия Имя Отчество @username</b>\n\n"
-        "Пример: <i>Иванов Иван Иванович @ivanov</i>",
-        reply_markup=ReplyKeyboardRemove(),
-        parse_mode=ParseMode.HTML
-    )
+    "📝 Введите ваше ФИО в формате:\n"
+    "<b>Фамилия Имя Отчество</b>\n\n"
+    "Пример: <i>Иванов Иван Иванович</i>",
+    reply_markup=ReplyKeyboardRemove(),
+    parse_mode=ParseMode.HTML
+)
     await state.set_state(RequestForm.full_name)
 
 @dp.message(RequestForm.full_name)
 async def process_full_name(message: types.Message, state: FSMContext):
-    # Разбиваем сообщение на части
-    parts = message.text.split()
-    
-    # Проверяем минимальное количество частей (ФИО + логин)
-    if len(parts) < 4:
-        await message.answer(
-            "❌ Неверный формат. Пожалуйста, укажите:\n"
-            "<b>Фамилия Имя Отчество @username</b>\n\n"
-            "Пример: <i>Иванов Иван Иванович @ivanov</i>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    # Извлекаем логин (последняя часть)
-    username = parts[-1]
-    
-    # Проверяем формат логина
-    if not username.startswith('@') or len(username) < 2:
-        await message.answer(
-            "❌ Неверный формат логина. Логин должен начинаться с @ и содержать имя пользователя.\n"
-            "Пример: <i>@ivanov</i>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-    
-    # Проверяем ФИО (все части кроме последней)
-    fio = ' '.join(parts[:-1])
-    if not re.match(r"^[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+$", fio):
+    # Проверяем ФИО
+    if not re.match(r"^[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+\s[А-ЯЁ][а-яё]+$", message.text):
         await message.answer(
             "❌ Неверный формат ФИО. Пожалуйста, укажите:\n"
-            "<b>Фамилия Имя Отчество @username</b>\n\n"
-            "Пример: <i>Иванов Иван Иванович @ivanov</i>",
+            "<b>Фамилия Имя Отчество</b>\n\n"
+            "Пример: <i>Иванов Иван Иванович</i>",
             parse_mode=ParseMode.HTML
         )
         return
     
     # Сохраняем данные
     await state.update_data({
-        'full_name': fio, 
-        'telegram_username': username[1:]
+        'full_name': message.text.strip()
     })
-    
     data = await state.get_data()
     if "🚨 Проблема" in data["request_type"]:
         prompt = "🔧 Опишите проблему:"
@@ -476,13 +461,12 @@ async def finish_request(message: types.Message, state: FSMContext):
         request_text = (
             f"{data['request_type']} #{request_id}\n"
             f"👤 ФИО: {data['full_name']}\n"
-            f"🔗 Логин: @{message.from_user.username}\n"
+            f"🔗 Логин: @{data.get('username', message.from_user.username)}\n"  # Исправлено здесь
             f"🏢 Отдел: {data['department']}\n"
             f"📝 Описание: {data['problem']}\n"
             f"📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
             f"🆕 Статус: Новая"
         )
-        
         # Отправляем заявку админу
         if data.get("photo"):
             # Если есть фото, отправляем с фото
